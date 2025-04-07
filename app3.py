@@ -10,7 +10,7 @@ import google.generativeai as genai
 init_db()
 
 # Configure Gemini-Pro API Key
-genai.configure(api_key="AIzaSyCjeWAsyXA24ercu7XRISggxH0_Fzf68Kw")
+genai.configure(api_key="Google API Key")
 
 # ---------------- Session Initialization ---------------- #
 
