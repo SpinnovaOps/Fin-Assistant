@@ -45,7 +45,7 @@ if st.session_state.tokenizer is None or st.session_state.model is None:
 import google.generativeai as genai
 
 # Initialize Gemini-Pro with API Key
-genai.configure(api_key="AIzaSyCjeWAsyXA24ercu7XRISggxH0_Fzf68Kw")
+genai.configure(api_key="Google API Key")
 
 if 'gemini_chat' not in st.session_state:
     st.session_state.gemini_chat = genai.GenerativeModel('gemini-pro').start_chat()
