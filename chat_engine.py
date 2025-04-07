@@ -10,7 +10,7 @@ from langchain.prompts import PromptTemplate
 from langchain.docstore.document import Document
 
 # SET YOUR GEMINI API KEY
-GEMINI_API_KEY = "AIzaSyBMhMP13_-94m6eZDRum-X020Ds7U-fk2I"
+GEMINI_API_KEY = "Key"
 genai.configure(api_key=GEMINI_API_KEY)
 
 # Load FAISS index
