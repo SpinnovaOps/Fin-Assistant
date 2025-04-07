@@ -41,7 +41,7 @@ import google.generativeai as genai
 
 def enhance_with_gemini(user_query, context, sentiment):
     # Configure the Gemini API using your API key
-    genai.configure(api_key="AIzaSyBMhMP13_-94m6eZDRum-X020Ds7U-fk2I")  # Replace with your actual key
+    genai.configure(api_key="KEY")  # Replace with your actual key
 
     # Correct model name: must match the tuned model ID from your console
     model = genai.GenerativeModel(
