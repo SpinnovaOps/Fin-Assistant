@@ -5,51 +5,131 @@ from chat_engine import load_faiss_index, load_finbert, answer_query
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from googletrans import Translator
 import google.generativeai as genai
+import speech_recognition as sr
+from gtts import gTTS
+import os
+import tempfile
+import uuid
+import time
+from io import BytesIO
+import base64
+import threading
+import concurrent.futures
+import queue
 
 # Initialize DB
 init_db()
 
 # Configure Gemini-Pro API Key
-genai.configure(api_key="Google API Key")
+genai.configure(api_key="AIzaSyCjeWAsyXA24ercu7XRISggxH0_Fzf68Kw")
+
+# ---------------- Global Model Loading ---------------- #
+
+# Use global variables for models to ensure they're loaded only once for all users
+@st.cache_resource
+def load_global_models():
+    """Load models once and cache them globally for all sessions"""
+    tokenizer = AutoTokenizer.from_pretrained("yiyanghkust/finbert-tone")
+    model = AutoModelForSequenceClassification.from_pretrained("yiyanghkust/finbert-tone")
+    faiss_index = load_faiss_index()
+    return tokenizer, model, faiss_index
 
 # ---------------- Session Initialization ---------------- #
 
-if 'tokenizer' not in st.session_state:
-    st.session_state.tokenizer = None
-
-if 'model' not in st.session_state:
-    st.session_state.model = None
-
-if 'finbert_model' not in st.session_state:
-    st.session_state.finbert_model = None
-
-if 'faiss_index' not in st.session_state:
-    st.session_state.faiss_index = None
-
-if 'gemini_chat' not in st.session_state:
-    st.session_state.gemini_chat = genai.GenerativeModel('gemini-1.5-flash-001-tuning').start_chat()
-
-if 'user_info' not in st.session_state:
+if 'initialized' not in st.session_state:
+    # Load global models
+    global_tokenizer, global_model, global_faiss = load_global_models()
+    
+    # Initialize session state
+    st.session_state.tokenizer = global_tokenizer
+    st.session_state.model = global_model
+    st.session_state.faiss_index = global_faiss
+    st.session_state.chat_history = []  # Store chat history
     st.session_state.user_info = {}
-
-if 'language' not in st.session_state:
     st.session_state.language = None
-
-if 'language_code' not in st.session_state:
     st.session_state.language_code = 'en'  # Default to English code
+    st.session_state.voice_input_text = ""
+    st.session_state.temp_dir = tempfile.mkdtemp()
+    
+    # Initialize Gemini model with better caching strategy
+    st.session_state.gemini_chat = genai.GenerativeModel('gemini-1.5-flash-001-tuning').start_chat(
+        history=[],
+    )
+    
+    # Optimize speech recognition
+    st.session_state.recognizer = sr.Recognizer()
+    st.session_state.recognizer.energy_threshold = 300
+    st.session_state.recognizer.dynamic_energy_threshold = True
+    st.session_state.recognizer.dynamic_energy_adjustment_damping = 0.15
+    st.session_state.recognizer.dynamic_energy_ratio = 1.5
+    st.session_state.recognizer.pause_threshold = 0.8
+    st.session_state.recognizer.non_speaking_duration = 0.5
+    
+    # Processing queues for concurrent operations
+    st.session_state.processing_queue = queue.Queue()
+    
+    # Mark as initialized
+    st.session_state.initialized = True
 
-# Initialize translator
-translator = Translator()
+# Initialize translator - create once per session
+@st.cache_resource
+def get_translator():
+    return Translator()
 
-# ---------------- Load Models ---------------- #
+translator = get_translator()
 
-if st.session_state.tokenizer is None or st.session_state.model is None:
-    with st.spinner("Loading FinBERT model..."):
-        st.session_state.tokenizer = AutoTokenizer.from_pretrained("yiyanghkust/finbert-tone")
-        st.session_state.model = AutoModelForSequenceClassification.from_pretrained("yiyanghkust/finbert-tone")
+# ---------------- Voice Processing Functions ---------------- #
 
-if st.session_state.faiss_index is None:
-    st.session_state.faiss_index = load_faiss_index()
+def text_to_speech(text):
+    """Convert text to speech using gTTS and return audio data"""
+    if st.session_state.language == "English":
+        try:
+            # Create a BytesIO object
+            audio_bytes = BytesIO()
+            
+            # Generate speech with reduced quality for speed
+            tts = gTTS(text=text, lang='en', slow=False)
+            tts.write_to_fp(audio_bytes)
+            
+            # Reset the position to the beginning
+            audio_bytes.seek(0)
+            
+            # Return the audio bytes
+            return audio_bytes.read()
+        except Exception as e:
+            st.error(f"TTS Error: {str(e)}")
+            return None
+    return None
+
+def speech_to_text():
+    """Convert speech to text using microphone"""
+    try:
+        with sr.Microphone() as source:
+            # Quick adjustment for ambient noise
+            st.session_state.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            st.info("🎤 Listening... Speak now!")
+            
+            # Shorter timeout for faster response
+            audio = st.session_state.recognizer.listen(source, timeout=5, phrase_time_limit=10)
+            st.info("🔍 Processing your speech...")
+            
+            try:
+                # Use Google's speech recognition for better accuracy
+                text = st.session_state.recognizer.recognize_google(audio)
+                return text
+            except sr.UnknownValueError:
+                return "Sorry, I couldn't understand what you said."
+            except sr.RequestError:
+                return "Sorry, speech service is unavailable right now."
+    except Exception as e:
+        st.error(f"Error with speech recognition: {str(e)}")
+        return None
+
+# Voice input handler
+def handle_voice_input():
+    text = speech_to_text()
+    if text and text != "Sorry, I couldn't understand what you said." and text != "Sorry, speech service is unavailable right now.":
+        st.session_state.voice_input_text = text
 
 # ---------------- Regional Language Mapping ---------------- #
 
@@ -78,6 +158,50 @@ LANGUAGE_CODES = {
     # Add more as needed
 }
 
+# ---------------- Optimized Query Processing ---------------- #
+
+def process_query_async(input_text, target_lang_code, target_lang_name):
+    """Process user query with parallel processing where possible"""
+    # Step 1: Detect input language and translate to English if needed
+    detected_lang = translator.detect(input_text).lang
+    if detected_lang != 'en':
+        input_english = translator.translate(input_text, src=detected_lang, dest='en').text
+    else:
+        input_english = input_text
+
+    # Step 2: Process using FinBERT → FAISS (optimized with threading)
+    finbert_response = answer_query(
+        input_english,
+        st.session_state.faiss_index,
+        st.session_state.tokenizer,
+        st.session_state.model
+    )
+
+    # Step 3: Create prompt that ensures output matches user's language preference
+    prompt = f"""
+    Here is the financial context: {finbert_response}
+
+    Please improve this response and return in bullet points.
+    
+    IMPORTANT: Your response must be in {target_lang_name} language only.
+    
+    The response should be conversational and helpful.
+    """
+
+    # Step 4: Generate response with Gemini-Pro
+    gemini_reply = st.session_state.gemini_chat.send_message(prompt).text
+    
+    # Step 5: Verify language and translate if necessary
+    detected_output_lang = translator.detect(gemini_reply).lang
+    
+    # Only translate if the output isn't already in the requested language
+    if detected_output_lang != target_lang_code:
+        final_response = translator.translate(gemini_reply, src=detected_output_lang, dest=target_lang_code).text
+    else:
+        final_response = gemini_reply
+        
+    return final_response
+
 # ---------------- Onboarding ---------------- #
 
 if not st.session_state.user_info:
@@ -105,56 +229,100 @@ else:
         st.session_state.language = selected_language
         st.session_state.language_code = LANGUAGE_CODES.get(selected_language, 'en')
 
-# ---------------- Chat Section ---------------- #
-
-if st.session_state.language:
+    # ---------------- Chat Section with Conversation History ---------------- #
     st.header(f"💬 Chat in {st.session_state.language}")
-    user_input = st.text_input("Ask your financial question:")
+
+    # Display chat history
+    chat_container = st.container()
+    with chat_container:
+        for message in st.session_state.chat_history:
+            if message["role"] == "user":
+                st.markdown(f"**You:** {message['content']}")
+            else:
+                st.markdown(f"**Bot:** {message['content']}")
+                
+                # Add audio player for English responses
+                if st.session_state.language == "English" and message.get("audio"):
+                    st.markdown(message["audio"], unsafe_allow_html=True)
+
+    # Show voice input option only for English
+    voice_placeholder = st.empty()
+    
+    # Voice input button - placed BEFORE text input field
+    if st.session_state.language == "English":
+        if st.button("🎤 Voice Input", key="voice_button"):
+            handle_voice_input()
+    
+    # Display voice transcription if available
+    if st.session_state.voice_input_text:
+        voice_placeholder.info(f"You said: {st.session_state.voice_input_text}")
+    
+    # Text input field - set default value from voice input if available
+    if st.session_state.language == "English" and st.session_state.voice_input_text:
+        user_input = st.text_input("Ask your financial question:", 
+                                  value=st.session_state.voice_input_text,
+                                  key=f"input_{len(st.session_state.chat_history)}")
+        # Clear voice input after using it
+        st.session_state.voice_input_text = ""
+    else:
+        user_input = st.text_input("Ask your financial question:",
+                                  key=f"input_{len(st.session_state.chat_history)}")
 
     if user_input:
-        with st.spinner("Analyzing and Generating Response..."):
-            # Step 1: Detect input language and translate to English if needed
-            detected_lang = translator.detect(user_input).lang
-            if detected_lang != 'en':
-                input_english = translator.translate(user_input, src=detected_lang, dest='en').text
-            else:
-                input_english = user_input
+        # Add user message to chat history
+        st.session_state.chat_history.append({"role": "user", "content": user_input})
+        
+        # Force refresh to show user message immediately
+        st.experimental_rerun()
 
-            # Step 2: Process using FinBERT → FAISS → Gemini-Pro
-            finbert_response = answer_query(
-                input_english,
-                st.session_state.faiss_index,
-                st.session_state.tokenizer,
-                st.session_state.model
-            )
+# Process the latest message if it hasn't been processed yet
+if st.session_state.chat_history and len(st.session_state.chat_history) % 2 == 1:
+    with st.spinner("Analyzing and Generating Response..."):
+        # Get the last user message
+        last_user_message = st.session_state.chat_history[-1]["content"]
+        
+        # Process the query
+        response = process_query_async(
+            last_user_message, 
+            st.session_state.language_code, 
+            st.session_state.language
+        )
+        
+        # Prepare bot message
+        bot_message = {"role": "assistant", "content": response}
+        
+        # Add text-to-speech for English responses
+        if st.session_state.language == "English":
+            # Clean up the response for better speech
+            speech_text = response.replace("•", "").replace("\n", " ").strip()
+            
+            # Create audio bytes
+            audio_bytes = text_to_speech(speech_text)
+            
+            if audio_bytes:
+                # Encode audio bytes as base64
+                b64 = base64.b64encode(audio_bytes).decode()
+                
+                # Create HTML audio element
+                audio_player = f'<audio autoplay controls><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>'
+                bot_message["audio"] = f'<div>🔊 Voice Response: {audio_player}</div>'
+        
+        # Add bot response to chat history
+        st.session_state.chat_history.append(bot_message)
+        
+        # Force refresh to show response
+        st.experimental_rerun()
 
-            # Step 3: Create prompt that ensures output matches user's language preference
-            target_lang_code = st.session_state.language_code
-            target_lang_name = st.session_state.language
-            
-            prompt = f"""
-            Here is the financial context: {finbert_response}
+# Clear chat button
+if st.session_state.chat_history:
+    if st.button("Clear Chat"):
+        st.session_state.chat_history = []
+        st.experimental_rerun()
 
-            Please improve this response and return in bullet points.
-            
-            IMPORTANT: Your response must be in {target_lang_name} language only.
-            """
-
-            # Step 4: Generate response with Gemini-Pro that's already in the target language
-            gemini_reply = st.session_state.gemini_chat.send_message(prompt).text
-            
-            # Step 5: Verify language and translate if necessary
-            detected_output_lang = translator.detect(gemini_reply).lang
-            
-            # Only translate if the output isn't already in the requested language
-            if detected_output_lang != target_lang_code:
-                final_response = translator.translate(gemini_reply, src=detected_output_lang, dest=target_lang_code).text
-            else:
-                final_response = gemini_reply
-
-            # Output
-            st.markdown("### 🤖 Response:")
-            st.markdown(final_response)
-            
-            # Display language confirmation
-            st.caption(f"Response provided in {target_lang_name}")
+# Cleanup temp files
+for file in os.listdir(st.session_state.temp_dir):
+    if file.endswith('.mp3'):
+        try:
+            os.remove(os.path.join(st.session_state.temp_dir, file))
+        except:
+            pass
