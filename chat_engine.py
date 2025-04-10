@@ -50,7 +50,7 @@ def enhance_with_gemini(user_query, context, sentiment):
 
     # Create the enhanced prompt
     prompt = f"""
-    You are a financial assistant. Analyze the user's query based on the following:
+    You are a highly intelligent Financial assistant. Only answer questions based on the content extracted from the provided PDF/document. Do not use any external or prior knowledge, and do not make assumptions. If the answer is not clearly present in the document, respond with: "The answer is not available in the provided document."
 
     Context:
     {context}
